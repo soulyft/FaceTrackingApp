@@ -18,6 +18,7 @@ struct FaceLandmarks {
     var rightEyeBlink: Bool
     var mouthOpen: CGFloat
     var smileFactor: CGFloat  // Positive = smile, Negative = frown.
+    var faceRect: CGRect?     // Bounding box for the entire face.
 }
 
 // ViewModel to publish detected landmarks for SwiftUI to consume.
@@ -25,18 +26,37 @@ class FaceDetectionViewModel: ObservableObject {
     @Published var landmarks: FaceLandmarks?
 }
 
+// A simple view that draws a face outline based on the detected face bounding box.
+struct FaceOutlineView: View {
+    var faceRect: CGRect
+    
+    var body: some View {
+        RoundedRectangle(cornerRadius: faceRect.width * 0.2)
+            .stroke(Color.green, lineWidth: 3)
+            .frame(width: faceRect.width, height: faceRect.height)
+            .position(x: faceRect.midX, y: faceRect.midY)
+    }
+}
+
 // The main SwiftUI view.
 struct ContentView: View {
     @StateObject var viewModel = FaceDetectionViewModel()
+    @State private var faceOpacity: Double = 0.5  // Controls the face outline transparency.
     
     var body: some View {
         GeometryReader { geometry in
             ZStack {
-                // Camera view as background.
+                // Camera preview as the background.
                 CameraView(viewModel: viewModel)
                     .edgesIgnoringSafeArea(.all)
                 
-                // Overlay facial features: eyes and mouth.
+                // If available, draw the face outline (with adjustable transparency).
+                if let faceRect = viewModel.landmarks?.faceRect {
+                    FaceOutlineView(faceRect: faceRect)
+                        .opacity(faceOpacity)
+                }
+                
+                // Overlay dynamic facial features: eyes and mouth.
                 if let landmarks = viewModel.landmarks {
                     // Left eye: if blinking, show a horizontal line; otherwise, a circle.
                     if landmarks.leftEyeBlink {
@@ -72,6 +92,14 @@ struct ContentView: View {
                         .frame(width: 80, height: 40)
                         .position(landmarks.mouth)
                 }
+                
+                // Slider at the bottom to control the face outline transparency.
+                VStack {
+                    Spacer()
+                    Slider(value: $faceOpacity, in: 0...1)
+                        .padding()
+                        .accentColor(.green)
+                }
             }
         }
     }
@@ -87,9 +115,8 @@ struct MouthShape: Shape {
         var path = Path()
         let start = CGPoint(x: rect.minX, y: rect.midY)
         let end = CGPoint(x: rect.maxX, y: rect.midY)
-        // The basic offset for mouth openness.
-        let openOffset = 40 * mouthOpen
-        // The smileFactor adjusts the curve: positive for smile (raising the curve), negative for frown.
+        // Increase sensitivity: reduce the baseline and multiply more.
+        let openOffset = 40 * mouthOpen  // Adjust this multiplier if needed.
         let expressionOffset = -20 * smileFactor
         let control = CGPoint(x: rect.midX, y: rect.midY + openOffset + expressionOffset)
         path.move(to: start)
@@ -109,7 +136,7 @@ struct CameraView: UIViewRepresentable {
     }
     
     func updateUIView(_ uiView: PreviewView, context: Context) {
-        // No dynamic update needed.
+        // No update code needed.
     }
 }
 
@@ -208,7 +235,7 @@ extension PreviewView: AVCaptureVideoDataOutputSampleBufferDelegate {
                let observation = results.first,
                let landmarks = observation.landmarks {
                 
-                // Set a slightly more sensitive blink threshold.
+                // Set a slightly sensitive blink threshold.
                 let blinkThreshold: CGFloat = 0.3
                 
                 // Process left eye.
@@ -216,8 +243,7 @@ extension PreviewView: AVCaptureVideoDataOutputSampleBufferDelegate {
                 var leftEyeBlink = false
                 if let leftEyeData = self.computeCenterAndAspect(for: landmarks.leftEye?.normalizedPoints) {
                     leftEyeCenter = leftEyeData.center
-                    let aspectRatio = leftEyeData.aspect
-                    leftEyeBlink = aspectRatio < blinkThreshold
+                    leftEyeBlink = leftEyeData.aspect < blinkThreshold
                 }
                 
                 // Process right eye.
@@ -225,15 +251,8 @@ extension PreviewView: AVCaptureVideoDataOutputSampleBufferDelegate {
                 var rightEyeBlink = false
                 if let rightEyeData = self.computeCenterAndAspect(for: landmarks.rightEye?.normalizedPoints) {
                     rightEyeCenter = rightEyeData.center
-                    let aspectRatio = rightEyeData.aspect
-                    rightEyeBlink = aspectRatio < blinkThreshold
+                    rightEyeBlink = rightEyeData.aspect < blinkThreshold
                 }
-                
-                // Adjust eye positions: move left eye slightly right & down, right eye slightly left & down.
-                leftEyeCenter.x += 5
-                leftEyeCenter.y += 10
-                rightEyeCenter.x -= 5
-                rightEyeCenter.y += 10
                 
                 // Process mouth.
                 var mouthCenter = CGPoint.zero
@@ -256,27 +275,24 @@ extension PreviewView: AVCaptureVideoDataOutputSampleBufferDelegate {
                     let height = maxY - minY
                     let aspect = (width > 0) ? (height / width) : 0
                     let rawMouthRatio = aspect
-                    let baseline: CGFloat = 0.15
+                    let baseline: CGFloat = 0.10   // Lower baseline for increased sensitivity.
                     let adjusted = max(rawMouthRatio - baseline, 0)
-                    mouthOpen = min(adjusted * 5.0, 1.0)
+                    mouthOpen = min(adjusted * 8.0, 1.0)  // Increased multiplier.
                     
                     // Compute smile/frown factor.
-                    // Identify mouth corners.
                     let leftCorner = convertedLips.min(by: { $0.x < $1.x })!
                     let rightCorner = convertedLips.max(by: { $0.x < $1.x })!
                     let midX = (leftCorner.x + rightCorner.x) / 2
-                    // Line connecting the corners.
                     let slope = (rightCorner.y - leftCorner.y) / (rightCorner.x - leftCorner.x)
                     let b = leftCorner.y - slope * leftCorner.x
                     let expectedY = slope * midX + b
-                    // Delta: if mouth center is above the line, delta is positive (smile); if below, negative (frown).
                     let delta = expectedY - mouthCenter.y
-                    // Normalize delta (adjust divisor as needed for sensitivity).
                     smileFactor = max(min(delta / 20.0, 1), -1)
                 }
                 
-                // Adjust mouth position: raise it slightly.
-                mouthCenter.y -= 10
+                // Compute the face bounding box.
+                let faceBoundingBox = observation.boundingBox
+                let convertedFaceRect = self.previewLayer.layerRectConverted(fromMetadataOutputRect: faceBoundingBox)
                 
                 DispatchQueue.main.async {
                     viewModel.landmarks = FaceLandmarks(
@@ -286,7 +302,8 @@ extension PreviewView: AVCaptureVideoDataOutputSampleBufferDelegate {
                         leftEyeBlink: leftEyeBlink,
                         rightEyeBlink: rightEyeBlink,
                         mouthOpen: mouthOpen,
-                        smileFactor: smileFactor
+                        smileFactor: smileFactor,
+                        faceRect: convertedFaceRect
                     )
                 }
             } else {
