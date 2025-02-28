@@ -9,45 +9,64 @@ import SwiftUI
 import AVFoundation
 import Vision
 
-// Model to store facial landmark positions
+// Model to store facial landmark positions and expression metrics.
 struct FaceLandmarks {
     var leftEye: CGPoint
     var rightEye: CGPoint
     var mouth: CGPoint
+    var leftEyeBlink: Bool
+    var rightEyeBlink: Bool
+    var mouthOpen: CGFloat
 }
 
-// ViewModel to publish detected landmarks for SwiftUI to consume
+// ViewModel to publish detected landmarks for SwiftUI to consume.
 class FaceDetectionViewModel: ObservableObject {
     @Published var landmarks: FaceLandmarks?
 }
 
-// The main SwiftUI view
+// The main SwiftUI view.
 struct ContentView: View {
     @StateObject var viewModel = FaceDetectionViewModel()
     
     var body: some View {
         GeometryReader { geometry in
             ZStack {
-                // Camera view as background
+                // Camera view as background.
                 CameraView(viewModel: viewModel)
                     .edgesIgnoringSafeArea(.all)
                 
-                // Overlay basic facial features: eyes and mouth.
+                // Overlay facial features: eyes and mouth.
                 if let landmarks = viewModel.landmarks {
-                    // Left eye
-                    Circle()
+                    // Left eye: if blinking, show a line; otherwise, a circle.
+                    if landmarks.leftEyeBlink {
+                        Path { path in
+                            path.move(to: CGPoint(x: landmarks.leftEye.x - 20, y: landmarks.leftEye.y))
+                            path.addLine(to: CGPoint(x: landmarks.leftEye.x + 20, y: landmarks.leftEye.y))
+                        }
                         .stroke(Color.red, lineWidth: 3)
-                        .frame(width: 40, height: 40)
-                        .position(landmarks.leftEye)
+                    } else {
+                        Circle()
+                            .stroke(Color.red, lineWidth: 3)
+                            .frame(width: 40, height: 40)
+                            .position(landmarks.leftEye)
+                    }
                     
-                    // Right eye
-                    Circle()
+                    // Right eye.
+                    if landmarks.rightEyeBlink {
+                        Path { path in
+                            path.move(to: CGPoint(x: landmarks.rightEye.x - 20, y: landmarks.rightEye.y))
+                            path.addLine(to: CGPoint(x: landmarks.rightEye.x + 20, y: landmarks.rightEye.y))
+                        }
                         .stroke(Color.red, lineWidth: 3)
-                        .frame(width: 40, height: 40)
-                        .position(landmarks.rightEye)
+                    } else {
+                        Circle()
+                            .stroke(Color.red, lineWidth: 3)
+                            .frame(width: 40, height: 40)
+                            .position(landmarks.rightEye)
+                    }
                     
-                    // Mouth (using a custom shape)
-                    MouthShape()
+                    // Mouth: shape changes based on how open the mouth is.
+                    MouthShape(mouthOpen: landmarks.mouthOpen)
                         .stroke(Color.blue, lineWidth: 3)
                         .frame(width: 80, height: 40)
                         .position(landmarks.mouth)
@@ -57,14 +76,17 @@ struct ContentView: View {
     }
 }
 
-// A simple custom shape to represent the mouth as a quadratic curve.
+// A custom shape to represent the mouth as a quadratic curve.
+// The control point is adjusted based on the 'mouthOpen' parameter.
 struct MouthShape: Shape {
+    var mouthOpen: CGFloat
+    
     func path(in rect: CGRect) -> Path {
         var path = Path()
-        // Draw a simple arc-like curve for the mouth.
         let start = CGPoint(x: rect.minX, y: rect.midY)
         let end = CGPoint(x: rect.maxX, y: rect.midY)
-        let control = CGPoint(x: rect.midX, y: rect.midY + 10)
+        // Adjust the control point's vertical offset based on mouthOpen.
+        let control = CGPoint(x: rect.midX, y: rect.midY + 10 * mouthOpen)
         path.move(to: start)
         path.addQuadCurve(to: end, control: control)
         return path
@@ -82,7 +104,7 @@ struct CameraView: UIViewRepresentable {
     }
     
     func updateUIView(_ uiView: PreviewView, context: Context) {
-        // No dynamic update needed
+        // No dynamic update needed.
     }
 }
 
@@ -120,19 +142,21 @@ class PreviewView: UIView {
         previewLayer.frame = bounds
     }
     
-    // Helper function: averages an array of points and converts from Vision’s normalized coordinates
-    // into the previewLayer’s coordinate system.
-    private func averageAndConvert(_ points: [CGPoint]?) -> CGPoint? {
+    // Converts an array of normalized Vision points into a bounding CGRect in the preview layer's coordinate system.
+    private func boundingRectConverted(_ points: [CGPoint]?) -> CGRect? {
         guard let points = points, !points.isEmpty else { return nil }
-        let sum = points.reduce(CGPoint.zero) { (result, point) -> CGPoint in
-            CGPoint(x: result.x + point.x, y: result.y + point.y)
+        let convertedPoints = points.map {
+            previewLayer.layerPointConverted(fromCaptureDevicePoint: CGPoint(x: $0.x, y: 1 - $0.y))
         }
-        let count = CGFloat(points.count)
-        let avg = CGPoint(x: sum.x / count, y: sum.y / count)
-        // Vision’s normalized coordinates have the origin at the bottom-left.
-        // Adjust by flipping the y coordinate before converting.
-        let adjusted = CGPoint(x: avg.x, y: 1 - avg.y)
-        return previewLayer.layerPointConverted(fromCaptureDevicePoint: adjusted)
+        guard let first = convertedPoints.first else { return nil }
+        var minX = first.x, maxX = first.x, minY = first.y, maxY = first.y
+        for pt in convertedPoints {
+            minX = min(minX, pt.x)
+            maxX = max(maxX, pt.x)
+            minY = min(minY, pt.y)
+            maxY = max(maxY, pt.y)
+        }
+        return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
     }
     
     private func configureSession() {
@@ -149,7 +173,7 @@ class PreviewView: UIView {
                 session.addOutput(videoDataOutput)
             }
             
-            // Set the video orientation to portrait and mirror the front camera.
+            // Set video orientation to portrait and mirror the front camera.
             if let connection = videoDataOutput.connection(with: .video) {
                 connection.videoOrientation = .portrait
                 connection.isVideoMirrored = true
@@ -167,24 +191,56 @@ extension PreviewView: AVCaptureVideoDataOutputSampleBufferDelegate {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
               let viewModel = viewModel else { return }
         
-        // Use VNImageRequestHandler with the appropriate orientation.
+        // Use VNImageRequestHandler with proper orientation.
         let requestHandler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .leftMirrored)
         let faceLandmarksRequest = VNDetectFaceLandmarksRequest { [weak self] request, error in
             guard let self = self else { return }
             if let results = request.results as? [VNFaceObservation],
                let observation = results.first,
                let landmarks = observation.landmarks {
-                // Convert landmark points for eyes and mouth using our helper.
-                let leftEyePoint = self.averageAndConvert(landmarks.leftEye?.normalizedPoints)
-                let rightEyePoint = self.averageAndConvert(landmarks.rightEye?.normalizedPoints)
-                let mouthPoint = self.averageAndConvert(landmarks.outerLips?.normalizedPoints)
+                
+                // Define a blink threshold: if the eye aspect ratio is below this, consider it a blink.
+                let blinkThreshold: CGFloat = 0.2
+                
+                // Process left eye.
+                var leftEyeCenter = CGPoint.zero
+                var leftEyeBlink = false
+                if let leftEyeRect = self.boundingRectConverted(landmarks.leftEye?.normalizedPoints) {
+                    leftEyeCenter = CGPoint(x: leftEyeRect.midX, y: leftEyeRect.midY)
+                    let aspectRatio = leftEyeRect.height / leftEyeRect.width
+                    leftEyeBlink = aspectRatio < blinkThreshold
+                }
+                
+                // Process right eye.
+                var rightEyeCenter = CGPoint.zero
+                var rightEyeBlink = false
+                if let rightEyeRect = self.boundingRectConverted(landmarks.rightEye?.normalizedPoints) {
+                    rightEyeCenter = CGPoint(x: rightEyeRect.midX, y: rightEyeRect.midY)
+                    let aspectRatio = rightEyeRect.height / rightEyeRect.width
+                    rightEyeBlink = aspectRatio < blinkThreshold
+                }
+                
+                // Process mouth.
+                var mouthCenter = CGPoint.zero
+                var mouthOpen: CGFloat = 0.0
+                if let mouthRect = self.boundingRectConverted(landmarks.outerLips?.normalizedPoints) {
+                    mouthCenter = CGPoint(x: mouthRect.midX, y: mouthRect.midY)
+                    // Calculate mouth open ratio based on the height-to-width ratio.
+                    mouthOpen = mouthRect.height / mouthRect.width
+                    // Clamp the value between 0 and 1 for our UI.
+                    mouthOpen = min(max(mouthOpen, 0), 1)
+                }
                 
                 DispatchQueue.main.async {
-                    if let left = leftEyePoint, let right = rightEyePoint, let mouth = mouthPoint {
-                        viewModel.landmarks = FaceLandmarks(leftEye: left, rightEye: right, mouth: mouth)
-                    } else {
-                        viewModel.landmarks = nil
-                    }
+                    // Only update if we have valid positions.
+                    viewModel.landmarks = FaceLandmarks(
+                        leftEye: leftEyeCenter,
+                        rightEye: rightEyeCenter,
+                        mouth: mouthCenter,
+                        leftEyeBlink: leftEyeBlink,
+                        rightEyeBlink: rightEyeBlink,
+                        mouthOpen: mouthOpen
+                    )
                 }
             } else {
                 DispatchQueue.main.async {
@@ -200,6 +256,7 @@ extension PreviewView: AVCaptureVideoDataOutputSampleBufferDelegate {
         }
     }
 }
+
 #Preview {
     ContentView()
 }
