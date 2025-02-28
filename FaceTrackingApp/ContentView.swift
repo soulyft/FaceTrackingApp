@@ -37,7 +37,7 @@ struct ContentView: View {
                 
                 // Overlay facial features: eyes and mouth.
                 if let landmarks = viewModel.landmarks {
-                    // Left eye: if blinking, show a line; otherwise, a circle.
+                    // Left eye: if blinking, show a horizontal line; otherwise, a circle.
                     if landmarks.leftEyeBlink {
                         Path { path in
                             path.move(to: CGPoint(x: landmarks.leftEye.x - 20, y: landmarks.leftEye.y))
@@ -85,8 +85,8 @@ struct MouthShape: Shape {
         var path = Path()
         let start = CGPoint(x: rect.minX, y: rect.midY)
         let end = CGPoint(x: rect.maxX, y: rect.midY)
-        // Adjust the control point's vertical offset based on mouthOpen.
-        let control = CGPoint(x: rect.midX, y: rect.midY + 10 * mouthOpen)
+        // Multiply the mouthOpen value by a larger factor (e.g., 40) for a more noticeable change.
+        let control = CGPoint(x: rect.midX, y: rect.midY + 40 * mouthOpen)
         path.move(to: start)
         path.addQuadCurve(to: end, control: control)
         return path
@@ -142,21 +142,25 @@ class PreviewView: UIView {
         previewLayer.frame = bounds
     }
     
-    // Converts an array of normalized Vision points into a bounding CGRect in the preview layer's coordinate system.
-    private func boundingRectConverted(_ points: [CGPoint]?) -> CGRect? {
+    /// Helper function that converts an array of normalized Vision points into converted points,
+    /// then returns both the average position and the aspect ratio (height/width) of the points.
+    private func computeCenterAndAspect(for points: [CGPoint]?) -> (center: CGPoint, aspect: CGFloat)? {
         guard let points = points, !points.isEmpty else { return nil }
-        let convertedPoints = points.map {
+        let converted = points.map {
             previewLayer.layerPointConverted(fromCaptureDevicePoint: CGPoint(x: $0.x, y: 1 - $0.y))
         }
-        guard let first = convertedPoints.first else { return nil }
-        var minX = first.x, maxX = first.x, minY = first.y, maxY = first.y
-        for pt in convertedPoints {
-            minX = min(minX, pt.x)
-            maxX = max(maxX, pt.x)
-            minY = min(minY, pt.y)
-            maxY = max(maxY, pt.y)
+        let sum = converted.reduce(CGPoint.zero) { (result, point) -> CGPoint in
+            CGPoint(x: result.x + point.x, y: result.y + point.y)
         }
-        return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+        let avg = CGPoint(x: sum.x / CGFloat(converted.count), y: sum.y / CGFloat(converted.count))
+        let minX = converted.map { $0.x }.min() ?? 0
+        let maxX = converted.map { $0.x }.max() ?? 0
+        let minY = converted.map { $0.y }.min() ?? 0
+        let maxY = converted.map { $0.y }.max() ?? 0
+        let width = maxX - minX
+        let height = maxY - minY
+        let aspect = (width > 0) ? (height / width) : 0
+        return (center: avg, aspect: aspect)
     }
     
     private func configureSession() {
@@ -200,39 +204,41 @@ extension PreviewView: AVCaptureVideoDataOutputSampleBufferDelegate {
                let landmarks = observation.landmarks {
                 
                 // Define a blink threshold: if the eye aspect ratio is below this, consider it a blink.
-                let blinkThreshold: CGFloat = 0.2
+                let blinkThreshold: CGFloat = 0.25
                 
                 // Process left eye.
                 var leftEyeCenter = CGPoint.zero
                 var leftEyeBlink = false
-                if let leftEyeRect = self.boundingRectConverted(landmarks.leftEye?.normalizedPoints) {
-                    leftEyeCenter = CGPoint(x: leftEyeRect.midX, y: leftEyeRect.midY)
-                    let aspectRatio = leftEyeRect.height / leftEyeRect.width
+                if let leftEyeData = self.computeCenterAndAspect(for: landmarks.leftEye?.normalizedPoints) {
+                    leftEyeCenter = leftEyeData.center
+                    let aspectRatio = leftEyeData.aspect
                     leftEyeBlink = aspectRatio < blinkThreshold
                 }
                 
                 // Process right eye.
                 var rightEyeCenter = CGPoint.zero
                 var rightEyeBlink = false
-                if let rightEyeRect = self.boundingRectConverted(landmarks.rightEye?.normalizedPoints) {
-                    rightEyeCenter = CGPoint(x: rightEyeRect.midX, y: rightEyeRect.midY)
-                    let aspectRatio = rightEyeRect.height / rightEyeRect.width
+                if let rightEyeData = self.computeCenterAndAspect(for: landmarks.rightEye?.normalizedPoints) {
+                    rightEyeCenter = rightEyeData.center
+                    let aspectRatio = rightEyeData.aspect
                     rightEyeBlink = aspectRatio < blinkThreshold
                 }
                 
                 // Process mouth.
                 var mouthCenter = CGPoint.zero
                 var mouthOpen: CGFloat = 0.0
-                if let mouthRect = self.boundingRectConverted(landmarks.outerLips?.normalizedPoints) {
-                    mouthCenter = CGPoint(x: mouthRect.midX, y: mouthRect.midY)
-                    // Calculate mouth open ratio based on the height-to-width ratio.
-                    mouthOpen = mouthRect.height / mouthRect.width
-                    // Clamp the value between 0 and 1 for our UI.
-                    mouthOpen = min(max(mouthOpen, 0), 1)
+                if let mouthData = self.computeCenterAndAspect(for: landmarks.outerLips?.normalizedPoints) {
+                    mouthCenter = mouthData.center
+                    // Use the aspect ratio as a starting point.
+                    let rawMouthRatio = mouthData.aspect
+                    // When the mouth is closed, the ratio is very low.
+                    // Subtract a baseline (e.g., 0.15) and scale the difference for a more dramatic effect.
+                    let baseline: CGFloat = 0.15
+                    let adjusted = max(rawMouthRatio - baseline, 0)
+                    mouthOpen = min(adjusted * 5.0, 1.0)
                 }
                 
                 DispatchQueue.main.async {
-                    // Only update if we have valid positions.
                     viewModel.landmarks = FaceLandmarks(
                         leftEye: leftEyeCenter,
                         rightEye: rightEyeCenter,
@@ -256,6 +262,7 @@ extension PreviewView: AVCaptureVideoDataOutputSampleBufferDelegate {
         }
     }
 }
+
 
 #Preview {
     ContentView()
