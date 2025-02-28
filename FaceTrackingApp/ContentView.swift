@@ -19,32 +19,6 @@ struct FaceLandmarks {
 // ViewModel to publish detected landmarks for SwiftUI to consume
 class FaceDetectionViewModel: ObservableObject {
     @Published var landmarks: FaceLandmarks?
-    
-    func updateLandmarks(from observation: VNFaceObservation, in frameSize: CGSize) {
-        guard let landmarks2D = observation.landmarks else { return }
-        
-        // Average normalized points to compute positions in the frame
-        let leftEyePosition = averagePoint(from: landmarks2D.leftEye?.normalizedPoints, frameSize: frameSize)
-        let rightEyePosition = averagePoint(from: landmarks2D.rightEye?.normalizedPoints, frameSize: frameSize)
-        let mouthPosition = averagePoint(from: landmarks2D.outerLips?.normalizedPoints, frameSize: frameSize)
-        
-        if let left = leftEyePosition, let right = rightEyePosition, let mouth = mouthPosition {
-            DispatchQueue.main.async {
-                self.landmarks = FaceLandmarks(leftEye: left, rightEye: right, mouth: mouth)
-            }
-        }
-    }
-    
-    private func averagePoint(from points: [CGPoint]?, frameSize: CGSize) -> CGPoint? {
-        guard let points = points, !points.isEmpty else { return nil }
-        let sum = points.reduce(CGPoint.zero) { (result, point) -> CGPoint in
-            CGPoint(x: result.x + point.x, y: result.y + point.y)
-        }
-        let count = CGFloat(points.count)
-        // Convert from normalized (0-1) coordinates to actual frame coordinates
-        return CGPoint(x: (sum.x / count) * frameSize.width,
-                       y: (1 - sum.y / count) * frameSize.height)
-    }
 }
 
 // The main SwiftUI view
@@ -58,7 +32,7 @@ struct ContentView: View {
                 CameraView(viewModel: viewModel)
                     .edgesIgnoringSafeArea(.all)
                 
-                // Overlay geometric shapes for detected landmarks
+                // Overlay basic facial features: eyes and mouth.
                 if let landmarks = viewModel.landmarks {
                     // Left eye
                     Circle()
@@ -87,7 +61,7 @@ struct ContentView: View {
 struct MouthShape: Shape {
     func path(in rect: CGRect) -> Path {
         var path = Path()
-        // Draw an arc-like curve; adjust the control point for a smile or frown.
+        // Draw a simple arc-like curve for the mouth.
         let start = CGPoint(x: rect.minX, y: rect.midY)
         let end = CGPoint(x: rect.maxX, y: rect.midY)
         let control = CGPoint(x: rect.midX, y: rect.midY + 10)
@@ -146,6 +120,21 @@ class PreviewView: UIView {
         previewLayer.frame = bounds
     }
     
+    // Helper function: averages an array of points and converts from Vision’s normalized coordinates
+    // into the previewLayer’s coordinate system.
+    private func averageAndConvert(_ points: [CGPoint]?) -> CGPoint? {
+        guard let points = points, !points.isEmpty else { return nil }
+        let sum = points.reduce(CGPoint.zero) { (result, point) -> CGPoint in
+            CGPoint(x: result.x + point.x, y: result.y + point.y)
+        }
+        let count = CGFloat(points.count)
+        let avg = CGPoint(x: sum.x / count, y: sum.y / count)
+        // Vision’s normalized coordinates have the origin at the bottom-left.
+        // Adjust by flipping the y coordinate before converting.
+        let adjusted = CGPoint(x: avg.x, y: 1 - avg.y)
+        return previewLayer.layerPointConverted(fromCaptureDevicePoint: adjusted)
+    }
+    
     private func configureSession() {
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front) else { return }
         do {
@@ -160,10 +149,9 @@ class PreviewView: UIView {
                 session.addOutput(videoDataOutput)
             }
             
-            // Ensure the video is in portrait mode
+            // Set the video orientation to portrait and mirror the front camera.
             if let connection = videoDataOutput.connection(with: .video) {
                 connection.videoOrientation = .portrait
-                // For the front camera, mirror the image
                 connection.isVideoMirrored = true
             }
         } catch {
@@ -179,17 +167,25 @@ extension PreviewView: AVCaptureVideoDataOutputSampleBufferDelegate {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
               let viewModel = viewModel else { return }
         
-        // Get the dimensions of the frame
-        let frameWidth = CGFloat(CVPixelBufferGetWidth(pixelBuffer))
-        let frameHeight = CGFloat(CVPixelBufferGetHeight(pixelBuffer))
-        let frameSize = CGSize(width: frameWidth, height: frameHeight)
-        
-        // Create a Vision request handler
+        // Use VNImageRequestHandler with the appropriate orientation.
         let requestHandler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .leftMirrored)
-        let faceLandmarksRequest = VNDetectFaceLandmarksRequest { request, error in
+        let faceLandmarksRequest = VNDetectFaceLandmarksRequest { [weak self] request, error in
+            guard let self = self else { return }
             if let results = request.results as? [VNFaceObservation],
-               let observation = results.first {
-                viewModel.updateLandmarks(from: observation, in: frameSize)
+               let observation = results.first,
+               let landmarks = observation.landmarks {
+                // Convert landmark points for eyes and mouth using our helper.
+                let leftEyePoint = self.averageAndConvert(landmarks.leftEye?.normalizedPoints)
+                let rightEyePoint = self.averageAndConvert(landmarks.rightEye?.normalizedPoints)
+                let mouthPoint = self.averageAndConvert(landmarks.outerLips?.normalizedPoints)
+                
+                DispatchQueue.main.async {
+                    if let left = leftEyePoint, let right = rightEyePoint, let mouth = mouthPoint {
+                        viewModel.landmarks = FaceLandmarks(leftEye: left, rightEye: right, mouth: mouth)
+                    } else {
+                        viewModel.landmarks = nil
+                    }
+                }
             } else {
                 DispatchQueue.main.async {
                     viewModel.landmarks = nil
@@ -204,7 +200,6 @@ extension PreviewView: AVCaptureVideoDataOutputSampleBufferDelegate {
         }
     }
 }
-
 #Preview {
     ContentView()
 }
